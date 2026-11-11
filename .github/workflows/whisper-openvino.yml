@@ -45,7 +45,15 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-2025
+    # Pinned to windows-2022, not windows-2025: the build configures with
+    # -G "Visual Studio 17 2022", and GitHub moved the windows-2025 image
+    # to Visual Studio 2026 only, so CMake dies at configure time with
+    # "could not find any instance of Visual Studio" (run 42976132898).
+    # windows-2022 is the last label that ships VS 2022 (MSVC 14.44,
+    # v143 toolset). Migrating to VS 2026 would be a real change, not a
+    # label swap: CMake needs >= 4.2 for VS 2026 support, and the
+    # dumpbin-via-vswhere step below assumes a VS install it can find.
+    runs-on: windows-2022
     timeout-minutes: 60
     env:
       OPENVINO_VERSION: "2026.3.0"
