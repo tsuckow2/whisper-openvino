@@ -1,0 +1,208 @@
+name: Whisper (OpenVINO, Windows)
+
+# Builds a Windows whisper-server.exe from upstream whisper.cpp with the
+# encoder offloaded to OpenVINO (Intel CPU / integrated & discrete GPU),
+# for pool nodes whose whisper-server should run on Intel hardware
+# (e.g. a node whose dGPU is busy with chat models and whose iGPU would
+# otherwise sit idle).
+#
+# workflow_dispatch only, like gpu.yml: the build downloads a ~200 MB
+# OpenVINO archive and compiles C++, so it never runs on push or PR.
+# Run it from the Actions tab, download the artifact, and drop the
+# contents on the node next to the supervisor's other binaries.
+#
+# What the artifact is: whisper-server.exe + whisper-cli.exe + the
+# OpenVINO runtime DLLs they need, staged in one folder so the bundle is
+# self-contained (the smoke test runs the staged server with no OpenVINO
+# install on PATH). It does NOT include a ggml model or an OpenVINO
+# encoder IR model: the encoder only runs through OpenVINO when a
+# ggml-<model>-encoder-openvino.xml/.bin sits next to the ggml model
+# (generated per model with whisper.cpp's
+# models/convert-whisper-to-openvino.py). Without that IR file the server
+# still transcribes, with the encoder on CPU. Pick the device with the
+# entry's extra_args, e.g. ["--ov-e-device", "GPU"] (default is CPU).
+#
+# OpenVINO version: 2026.3.0, the version whisper.cpp's README recommends.
+# The archive filename carries a build number, so bumping the version
+# means updating OPENVINO_URL and OPENVINO_SHA256 together; both come from
+# https://storage.openvinotoolkit.org/repositories/openvino/packages/<major.minor>/windows/
+# (the .sha256 file sits next to the .zip there).
+
+on:
+  workflow_dispatch:
+    inputs:
+      whisper_ref:
+        description: "whisper.cpp ref to build (branch, tag, or SHA)"
+        default: "master"
+        required: true
+      smoke_model:
+        description: "ggml model for the server smoke test (empty skips the transcription check)"
+        default: "tiny.en"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      OPENVINO_VERSION: "2026.3.0"
+      OPENVINO_URL: "https://storage.openvinotoolkit.org/repositories/openvino/packages/2026.3/windows/openvino_toolkit_windows_2026.3.0.22451.bd8d6542e3c_x86_64.zip"
+      OPENVINO_SHA256: "4b26374eb342c3e0e4488b230cf8a16b6327e22b1ef12e45e5533cead06a66e3"
+      STAGE_DIR: "whisper-openvino-windows"
+    steps:
+      - name: Clone whisper.cpp
+        uses: actions/checkout@v7
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ inputs.whisper_ref }}
+          path: whisper.cpp
+
+      - name: Record whisper revision
+        shell: pwsh
+        run: |
+          $sha = (git -C whisper.cpp rev-parse HEAD).Trim()
+          "WHISPER_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "Whisper.cpp: $sha ($env:GITHUB_REF_NAME ref ${{ inputs.whisper_ref }})" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Download OpenVINO runtime
+        shell: pwsh
+        run: |
+          curl.exe -L --fail -o openvino.zip $env:OPENVINO_URL
+          $hash = (Get-FileHash openvino.zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:OPENVINO_SHA256) {
+            throw "OpenVINO archive SHA256 mismatch: got $hash, want $env:OPENVINO_SHA256"
+          }
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\openvino" | Out-Null
+          tar -xf openvino.zip -C "$env:RUNNER_TEMP\openvino"
+          $dir = Get-ChildItem -Directory "$env:RUNNER_TEMP\openvino" |
+            Where-Object { $_.Name -like 'openvino_toolkit_windows_*' } |
+            Select-Object -First 1
+          if (-not $dir) { throw "OpenVINO archive did not extract to an openvino_toolkit_windows_* directory" }
+          "OPENVINO_DIR=$($dir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "OpenVINO: $env:OPENVINO_VERSION ($($dir.Name))" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Configure (MSVC, OpenVINO on)
+        shell: pwsh
+        run: |
+          cmake -S whisper.cpp -B whisper.cpp\build `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DWHISPER_OPENVINO=ON `
+            -DWHISPER_BUILD_EXAMPLES=ON `
+            -DWHISPER_BUILD_TESTS=OFF `
+            "-DOpenVINO_DIR=$env:OPENVINO_DIR\runtime\cmake"
+
+      - name: Build whisper-server and whisper-cli
+        shell: pwsh
+        run: |
+          cmake --build whisper.cpp\build --config Release --parallel `
+            --target whisper-server whisper-cli
+
+      - name: Prove the server links OpenVINO
+        shell: pwsh
+        run: |
+          $exe = "whisper.cpp\build\bin\Release\whisper-server.exe"
+          if (-not (Test-Path $exe)) { throw "$exe was not built" }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -find 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe' |
+            Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found via vswhere" }
+          $imports = & $dumpbin /DEPENDENTS $exe
+          $imports | Out-String | Write-Host
+          if (-not ($imports -match 'openvino\.dll')) {
+            throw "whisper-server.exe does not import openvino.dll"
+          }
+
+      - name: Stage the self-contained bundle
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:STAGE_DIR | Out-Null
+          Copy-Item whisper.cpp\build\bin\Release\whisper-server.exe,
+            whisper.cpp\build\bin\Release\whisper-cli.exe $env:STAGE_DIR\
+          # Any DLL the build itself dropped next to the binaries
+          # (e.g. libomp.dll) rides along too.
+          Copy-Item whisper.cpp\build\bin\Release\*.dll $env:STAGE_DIR\ -ErrorAction SilentlyContinue
+          # OpenVINO runtime DLLs: core, CPU/GPU/NPU plugins, TBB.
+          Copy-Item "$env:OPENVINO_DIR\runtime\bin\intel64\Release\*.dll" $env:STAGE_DIR\
+          $tbb = "$env:OPENVINO_DIR\runtime\3rdparty\tbb\bin\*.dll"
+          if (Test-Path $tbb) { Copy-Item $tbb $env:STAGE_DIR\ }
+          if (-not (Test-Path "$env:STAGE_DIR\openvino.dll")) {
+            throw "openvino.dll did not land in the staged bundle"
+          }
+          @(
+            "whisper-server.exe (Windows x64) with OpenVINO $env:OPENVINO_VERSION",
+            "whisper.cpp revision: $env:WHISPER_SHA",
+            "Built by: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID",
+            "",
+            "Install: copy this whole folder to the node and point the supervisor at it:",
+            '  "whisper_server_bin": "C:\tools\whisper-openvino\whisper-server.exe"',
+            "The OpenVINO DLLs beside the exe are required; keep them together.",
+            "A Visual C++ Redistributable may be needed on a bare node.",
+            "",
+            "OpenVINO encode only engages when a ggml-<model>-encoder-openvino.xml/.bin",
+            "sits next to the ggml model (generate it per model with whisper.cpp's",
+            "models/convert-whisper-to-openvino.py). Without it the server still",
+            "transcribes, with the encoder on CPU. Choose the device with the entry's",
+            'extra_args, e.g. ["--ov-e-device", "GPU"] (default CPU). The first run',
+            "on a device is slow: OpenVINO compiles the IR to a device blob and",
+            "caches it."
+          ) | Out-File -FilePath "$env:STAGE_DIR\README.txt" -Encoding utf8
+
+      - name: Smoke test the staged server
+        if: ${{ inputs.smoke_model != '' }}
+        shell: pwsh
+        run: |
+          $model = "ggml-${{ inputs.smoke_model }}.bin"
+          curl.exe -L --fail -o $model `
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$model"
+          $proc = Start-Process -FilePath "$env:STAGE_DIR\whisper-server.exe" `
+            -ArgumentList '-m', "..\$model", '--host', '127.0.0.1', '--port', '18080' `
+            -WorkingDirectory $env:STAGE_DIR -PassThru `
+            -RedirectStandardOutput server.log -RedirectStandardError server.err.log
+          try {
+            $up = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              try {
+                $r = Invoke-WebRequest http://127.0.0.1:18080/ -UseBasicParsing -TimeoutSec 5
+                if ($r.StatusCode -eq 200) { $up = $true; break }
+              } catch { Start-Sleep -Seconds 5 }
+            }
+            if (-not $up) { throw "whisper-server did not serve its index page within 5 minutes" }
+            # Same shape the supervisor's health check probes.
+            $out = curl.exe -s -F "file=@whisper.cpp\samples\jfk.wav" `
+              -F response_format=json http://127.0.0.1:18080/inference
+            $out | Write-Host
+            if (-not ($out -match 'fellow Americans')) {
+              throw "smoke transcription did not return the expected JFK text"
+            }
+            "Smoke test: transcribed jfk.wav as expected (model ${{ inputs.smoke_model }})" |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          } finally {
+            if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+          }
+
+      - name: Self-test the staged server binary
+        if: ${{ inputs.smoke_model == '' }}
+        shell: pwsh
+        run: |
+          # No model was requested, so --help is the whole check: it proves
+          # the staged exe loads with only its bundled DLLs beside it.
+          & "$env:STAGE_DIR\whisper-server.exe" --help | Out-String | Write-Host
+          if ($LASTEXITCODE -ne 0) { throw "whisper-server.exe --help exited $LASTEXITCODE" }
+
+      - name: Zip and upload the bundle
+        shell: pwsh
+        run: |
+          $short = $env:WHISPER_SHA.Substring(0, 12)
+          $zip = "whisper-server-openvino-windows-$short.zip"
+          Compress-Archive -Path "$env:STAGE_DIR\*" -DestinationPath $zip
+          "ARTIFACT_ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "Artifact: $zip" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: whisper-server-openvino-windows
+          path: ${{ env.ARTIFACT_ZIP }}
+          retention-days: 90
