@@ -113,14 +113,19 @@ jobs:
         run: |
           $exe = "whisper.cpp\build\bin\Release\whisper-server.exe"
           if (-not (Test-Path $exe)) { throw "$exe was not built" }
+          # The build links whisper as a shared library, so the OpenVINO
+          # dependency lives in whisper.dll, not in the exe itself: the
+          # exe only imports whisper.dll + ggml.dll. Check the DLL.
+          $lib = "whisper.cpp\build\bin\Release\whisper.dll"
+          if (-not (Test-Path $lib)) { throw "$lib was not built" }
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $dumpbin = & $vswhere -latest -find 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe' |
             Select-Object -First 1
           if (-not $dumpbin) { throw "dumpbin.exe not found via vswhere" }
-          $imports = & $dumpbin /DEPENDENTS $exe
+          $imports = & $dumpbin /DEPENDENTS $lib
           $imports | Out-String | Write-Host
           if (-not ($imports -match 'openvino\.dll')) {
-            throw "whisper-server.exe does not import openvino.dll"
+            throw "whisper.dll does not import openvino.dll"
           }
 
       - name: Stage the self-contained bundle
