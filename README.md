@@ -19,8 +19,8 @@ Actions tab → **Whisper (OpenVINO, Windows)** → Run workflow.
   empty skips the transcription check and only runs `--help`).
 
 The workflow (manual trigger only) clones whisper.cpp, builds
-`whisper-server.exe` and `whisper-cli.exe` with MSVC and
-`-DWHISPER_OPENVINO=ON` against OpenVINO **2026.3.0** (the version
+`whisper-server.exe`, `whisper-cli.exe`, and `whisper-bench.exe` with MSVC
+and `-DWHISPER_OPENVINO=ON` against OpenVINO **2026.3.0** (the version
 whisper.cpp's README recommends; the archive download is SHA256-verified),
 checks the server really imports `openvino.dll`, stages a self-contained
 bundle, smoke-tests the staged server by transcribing `jfk.wav`, and

@@ -102,11 +102,11 @@ jobs:
             -DWHISPER_BUILD_TESTS=OFF `
             "-DOpenVINO_DIR=$env:OPENVINO_DIR\runtime\cmake"
 
-      - name: Build whisper-server and whisper-cli
+      - name: Build whisper-server, whisper-cli and whisper-bench
         shell: pwsh
         run: |
           cmake --build whisper.cpp\build --config Release --parallel `
-            --target whisper-server whisper-cli
+            --target whisper-server whisper-cli whisper-bench
 
       - name: Prove the server links OpenVINO
         shell: pwsh
@@ -133,7 +133,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path $env:STAGE_DIR | Out-Null
           Copy-Item whisper.cpp\build\bin\Release\whisper-server.exe,
-            whisper.cpp\build\bin\Release\whisper-cli.exe $env:STAGE_DIR\
+            whisper.cpp\build\bin\Release\whisper-cli.exe,
+            whisper.cpp\build\bin\Release\whisper-bench.exe $env:STAGE_DIR\
           # Any DLL the build itself dropped next to the binaries
           # (e.g. libomp.dll) rides along too.
           Copy-Item whisper.cpp\build\bin\Release\*.dll $env:STAGE_DIR\ -ErrorAction SilentlyContinue
@@ -146,6 +147,8 @@ jobs:
           }
           @(
             "whisper-server.exe (Windows x64) with OpenVINO $env:OPENVINO_VERSION",
+            "Also included: whisper-cli.exe (command-line transcription) and",
+            "whisper-bench.exe (benchmark the encoder/decoder on CPU or GPU).",
             "whisper.cpp revision: $env:WHISPER_SHA",
             "Built by: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID",
             "",
